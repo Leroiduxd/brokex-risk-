@@ -372,3 +372,4 @@ setTimeout(() => {
 }, Math.min(msToNextHour(), 15_000)); // start au prochain top d’heure (ou dans 15s max)
 
 console.log("Brokex hourly analyzer started. Watching assets:", ASSET_IDS.join(", "));
+
