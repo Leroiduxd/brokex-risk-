@@ -1,0 +1,13 @@
+{
+  "name": "brokex-hourly-analyzer",
+  "version": "1.0.0",
+  "description": "Hourly market analyzer for Brokex: fetch OHLC, compute indicators, log verdicts, compare after 1h using WSS live price.",
+  "main": "index.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}
