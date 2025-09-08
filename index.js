@@ -27,25 +27,44 @@ const WSS_URL = "wss://wss.brokex.trade:8443";
 // stocke { [assetId:number]: { price:number, ts:number, pair?:string } }
 const livePrices = Object.create(null);
 
+// reconnexion progressive
+let reconnectAttempts = 0;
+let loggedSampleOnce = false;
+
 function startWss() {
   const ws = new WebSocket(WSS_URL);
 
   ws.on("open", () => {
+    reconnectAttempts = 0;
     console.log("[WSS] connected");
   });
 
   ws.on("message", (raw) => {
     try {
       const data = JSON.parse(raw.toString());
-      // le payload semble être un dict { pairKey: payload }, payload.id, payload.instruments[0].currentPrice
+
+      if (!loggedSampleOnce) {
+        const keys = Object.keys(data);
+        console.log("[WSS sample keys]", keys.slice(0, 5));
+        loggedSampleOnce = true;
+      }
+
+      // payload attendu: { pairKey: payload }, avec payload.id et payload.instruments[0].currentPrice
       Object.entries(data).forEach(([pairKey, payload]) => {
-        const item = payload?.instruments?.[0];
+        // adapte si jamais ta structure change (ex: payload.data.instruments[0])
+        const item = payload?.instruments?.[0] ?? payload?.data?.instruments?.[0];
         if (!item) return;
-        const id = Object.prototype.hasOwnProperty.call(payload, "id") ? Number(payload.id) : undefined;
+
+        const id = Object.prototype.hasOwnProperty.call(payload, "id")
+          ? Number(payload.id)
+          : (Number(item?.id) || undefined);
+
         const price = parseFloat(item.currentPrice);
         const ts = Number(item.timestamp ?? Date.now());
+        const pairName = item.tradingPair?.toUpperCase?.() ?? String(pairKey);
+
         if (Number.isFinite(id) && Number.isFinite(price)) {
-          livePrices[id] = { price, ts, pair: item.tradingPair?.toUpperCase?.() ?? String(pairKey) };
+          livePrices[id] = { price, ts, pair: pairName };
         }
       });
     } catch (e) {
@@ -54,12 +73,16 @@ function startWss() {
   });
 
   ws.on("close", (code) => {
-    console.warn("[WSS] closed:", code, " — retrying in 3s");
-    setTimeout(startWss, 3000);
+    console.warn("[WSS] closed:", code);
+    const delay = Math.min(30000, 1000 * 2 ** Math.min(reconnectAttempts, 5));
+    reconnectAttempts++;
+    console.warn(`[WSS] retrying in ${delay}ms`);
+    setTimeout(startWss, delay);
   });
 
   ws.on("error", (err) => {
     console.error("[WSS] error:", err.message);
+    try { ws.close(); } catch (_) {}
   });
 }
 startWss();
@@ -243,10 +266,22 @@ function decideSignal({ rsi, macd, bb, adx, stoch, cci, ema50, ema200, close }) 
   return { score: +score.toFixed(2), verdict, notes };
 }
 
+// ==== Fetch avec timeout ====
+async function fetchWithTimeout(url, timeoutMs = 15000) {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, { signal: ctrl.signal });
+    return res;
+  } finally {
+    clearTimeout(t);
+  }
+}
+
 // ==== CORE FETCH ====
 async function fetchOHLC(pair, interval) {
   const url = BASE.replace("{PAIR}", pair).replace("{INTERVAL}", interval);
-  const res = await fetch(url);
+  const res = await fetchWithTimeout(url, 15000);
   if (!res.ok) throw new Error(`HTTP ${res.status} on ${url}`);
   return res.json();
 }
@@ -281,14 +316,14 @@ async function analyzeAsset(assetId) {
   const totalW = TIMEFRAMES.reduce((a, b) => a + b.weight, 0);
   const weightedScore = perTF.reduce((a, r) => a + r.score * r.weight, 0) / totalW;
 
-  let globalVerdict = "NEUTRAL / WAIT";
-  if (weightedScore >= 1.0) globalVerdict = "GLOBAL: LEAN LONG";
-  else if (weightedScore <= -1.0) globalVerdict = "GLOBAL: LEAN SHORT";
-
   // Prix live au moment de l'analyse
   const live = livePrices[assetId];
   const spot = live?.price ?? null;
   const pairName = live?.pair ?? null;
+
+  let globalVerdict = "NEUTRAL / WAIT";
+  if (weightedScore >= 1.0) globalVerdict = "GLOBAL: LEAN LONG";
+  else if (weightedScore <= -1.0) globalVerdict = "GLOBAL: LEAN SHORT";
 
   const now = new Date();
   const record = {
@@ -333,9 +368,6 @@ async function analyzeAsset(assetId) {
     };
     appendJsonLine(OUTCOMES_FILE, outcome);
 
-    // (Option) relancer immédiatement une analyse à T+1h
-    // analyzeAsset(assetId).catch(e => console.error("Re-analyze error:", e));
-
     console.log(`[OUTCOME] ${assetId} spotT=${spot ?? "NA"} spotT+1h=${spotLater ?? "NA"} correct=${correct}`);
   }, 60 * 60 * 1000);
 }
@@ -364,12 +396,38 @@ function msToNextHour() {
   return next - now;
 }
 
-// Lance une première passe dès qu’on a un peu de prix,
-// puis cadence toutes les heures alignées.
-setTimeout(() => {
-  runAllAssets();
-  setInterval(runAllAssets, 60 * 60 * 1000);
-}, Math.min(msToNextHour(), 15_000)); // start au prochain top d’heure (ou dans 15s max)
+// Attendre les 1ers ticks live pour nos assets (max timeout)
+async function waitForLive(ids, timeoutMs = 30000) {
+  const start = Date.now();
+  return new Promise((resolve, reject) => {
+    const iv = setInterval(() => {
+      const haveAll = ids.every(id => livePrices[id]?.price != null);
+      if (haveAll) {
+        clearInterval(iv);
+        resolve(true);
+      } else if (Date.now() - start > timeoutMs) {
+        clearInterval(iv);
+        reject(new Error("Timeout waiting for live prices"));
+      }
+    }, 250);
+  });
+}
 
-console.log("Brokex hourly analyzer started. Watching assets:", ASSET_IDS.join(", "));
+// ====== BOOTSTRAP ======
+(async () => {
+  console.log("Brokex hourly analyzer started. Watching assets:", ASSET_IDS.join(", "));
 
+  try {
+    await waitForLive(ASSET_IDS, 30000); // attendre jusqu'à 30s que le WSS pousse des prix
+    console.log("[BOOT] Live prices ready, starting first analysis.");
+  } catch (e) {
+    console.warn("[BOOT] Live prices not fully ready (timeout). Starting anyway.");
+  }
+
+  // Lance une première passe dès qu’on a un peu de prix,
+  // puis cadence toutes les heures alignées.
+  setTimeout(() => {
+    runAllAssets();
+    setInterval(runAllAssets, 60 * 60 * 1000);
+  }, Math.min(msToNextHour(), 15_000)); // start au prochain top d’heure (ou dans 15s max)
+})();
